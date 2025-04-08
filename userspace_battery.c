@@ -34,6 +34,8 @@ static ssize_t set_voltage_uv_store(struct device *dev, struct device_attribute 
     u64 val;
     int ret;
 
+    // Get the private data from the platform device's driver_data
+    // Note: In this structure, it's easier to just use the global g_batt_data
     if (!g_batt_data) return -ENODEV; // Should not happen if loaded correctly
 
     ret = kstrtou64(buf, 0, &val);
@@ -43,7 +45,8 @@ static ssize_t set_voltage_uv_store(struct device *dev, struct device_attribute 
     g_batt_data->voltage_uv = val;
     mutex_unlock(&g_batt_data->lock);
 
-    power_supply_changed(g_batt_data->psy); // Notify framework
+    // Notify the power_supply framework that a property may have changed
+    power_supply_changed(g_batt_data->psy);
     return count;
 }
 
@@ -72,6 +75,7 @@ static ssize_t set_status_store(struct device *dev, struct device_attribute *att
                                 const char *buf, size_t count) {
     int new_status = POWER_SUPPLY_STATUS_UNKNOWN; // Default
     size_t len = count;
+    bool changed = false;
 
     if (!g_batt_data) return -ENODEV;
 
@@ -96,16 +100,20 @@ static ssize_t set_status_store(struct device *dev, struct device_attribute *att
     mutex_lock(&g_batt_data->lock);
     if (g_batt_data->status_enum != new_status) {
         g_batt_data->status_enum = new_status;
-        mutex_unlock(&g_batt_data->lock);
+        changed = true;
+    }
+    mutex_unlock(&g_batt_data->lock);
+
+    if (changed) {
         power_supply_changed(g_batt_data->psy); // Notify only if changed
-    } else {
-        mutex_unlock(&g_batt_data->lock);
     }
     return count;
 }
 
 // --- Sysfs Attribute Definitions (for writable attributes) ---
-// Use DEVICE_ATTR_WO for Write-Only by userspace
+// Use DEVICE_ATTR_WO for Write-Only by userspace (permissions 0200 - write for owner only)
+// Or DEVICE_ATTR_RW for Read-Write if you want userspace to read them back (permissions 0644)
+// Let's make them WO as intended initially.
 static DEVICE_ATTR_WO(set_voltage_uv);
 static DEVICE_ATTR_WO(set_capacity);
 static DEVICE_ATTR_WO(set_status);
@@ -130,13 +138,21 @@ static int userspace_batt_get_property(struct power_supply *psy,
     struct userspace_batt_data *data = power_supply_get_drvdata(psy);
     int ret = 0;
 
-    if (!data) return -ENODEV;
+    if (!data) {
+         pr_warn_once("userspace_battery: get_property called with invalid data!\n");
+         return -ENODEV;
+    }
+
 
     mutex_lock(&data->lock);
 
     switch (psp) {
     case POWER_SUPPLY_PROP_VOLTAGE_NOW: // Expected in uV
-        val->intval = (int)data->voltage_uv; // Cast u64 to int for propval
+        // The propval is int, uV might exceed 32-bit signed int max (2.14V)
+        // It's better practice to store and report voltage_avg or voltage_ocv if possible
+        // Sticking to voltage_now for simplicity, but clamp or check range if needed.
+        // Let's assume for now typical LiPo voltages fit okay when casted.
+        val->intval = (int)data->voltage_uv;
         break;
     case POWER_SUPPLY_PROP_CAPACITY: // Expected 0-100
         val->intval = data->capacity;
@@ -158,24 +174,29 @@ static enum power_supply_property userspace_batt_properties[] = {
     POWER_SUPPLY_PROP_VOLTAGE_NOW,
     POWER_SUPPLY_PROP_CAPACITY,
     POWER_SUPPLY_PROP_STATUS,
+    // Add other properties like POWER_SUPPLY_PROP_TECHNOLOGY = POWER_SUPPLY_TECHNOLOGY_LIPO if desired
 };
 
 // --- Platform Driver Probe / Remove ---
 
 static int userspace_battery_probe(struct platform_device *pdev) {
     int ret;
-    struct power_supply_config psy_cfg = {}; // Use initializer
-    struct power_supply_desc *psy_desc;
+    struct power_supply_config psy_cfg = {};
+    struct power_supply_desc *psy_desc; // Allocate dynamically
+
+    dev_info(&pdev->dev, "userspace_battery: Probing platform device...\n");
 
     if (!g_batt_data) {
-        dev_err(&pdev->dev, "userspace_battery: Global data not allocated!\n");
+        dev_err(&pdev->dev, "userspace_battery: Global data not allocated during probe!\n");
         return -ENODEV;
     }
 
-    // Set the global platform device pointer for cleanup
+    // Set the global platform device pointer for cleanup reference
     g_batt_data->pdev = pdev;
+    // Associate our global data with this platform device instance
+    platform_set_drvdata(pdev, g_batt_data);
 
-    // Allocate and configure power supply description
+    // Allocate and configure power supply description using devm_ for automatic cleanup
     psy_desc = devm_kzalloc(&pdev->dev, sizeof(*psy_desc), GFP_KERNEL);
     if (!psy_desc) return -ENOMEM;
 
@@ -195,7 +216,7 @@ static int userspace_battery_probe(struct platform_device *pdev) {
     }
     dev_info(&pdev->dev, "userspace_battery: Registered power supply device.\n");
 
-    // Create the writable sysfs attributes under the platform device
+    // Create the writable sysfs attributes under the platform device's kobject
     // (/sys/devices/platform/userspace_battery/)
     ret = sysfs_create_group(&pdev->dev.kobj, &userspace_batt_sysfs_attr_group);
     if (ret) {
@@ -208,16 +229,15 @@ static int userspace_battery_probe(struct platform_device *pdev) {
     return 0; // Success
 }
 
-static int userspace_battery_remove(struct platform_device *pdev) {
+// Corrected signature: returns void, no return statement
+static void userspace_battery_remove(struct platform_device *pdev) {
     dev_info(&pdev->dev, "userspace_battery: Removing platform driver.\n");
 
     // Remove sysfs group created in probe
     sysfs_remove_group(&pdev->dev.kobj, &userspace_batt_sysfs_attr_group);
 
-    // power_supply registration/cleanup is handled by devm
-    // No need to free g_batt_data here, done in module_exit
-
-    return 0;
+    // power_supply registration/cleanup is handled by devm associated with pdev
+    // drvdata cleanup is handled in module_exit
 }
 
 // --- Platform Driver Definition ---
@@ -226,7 +246,7 @@ static struct platform_driver userspace_battery_platform_driver = {
         .name = "userspace_battery", // Must match platform device name
     },
     .probe = userspace_battery_probe,
-    .remove = userspace_battery_remove,
+    .remove = userspace_battery_remove, // Corrected type usage
 };
 
 // --- Module Init / Exit ---
@@ -263,6 +283,8 @@ static int __init userspace_battery_init(void) {
     pr_info("userspace_battery: Registered virtual platform device.\n");
 
     // Register the platform driver, which will trigger the probe function
+    // We need to associate our global data here if probe needs it immediately,
+    // but probe retrieves it via drvdata set later or uses global directly.
     ret = platform_driver_register(&userspace_battery_platform_driver);
     if (ret) {
         pr_err("userspace_battery: Failed to register platform driver, error %d\n", ret);
@@ -285,6 +307,7 @@ static void __exit userspace_battery_exit(void) {
     pr_info("userspace_battery: Unregistered platform driver.\n");
 
     // Unregister the platform device
+    // Check g_batt_data first as it might fail during init
     if (g_batt_data && g_batt_data->pdev) {
         platform_device_unregister(g_batt_data->pdev);
         pr_info("userspace_battery: Unregistered platform device.\n");
